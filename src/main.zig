@@ -16,6 +16,7 @@ pub fn main() !void {}
 const ValidationError = error{
     OutOfMemory,
     UnknownKey,
+    MissingKey,
     NullNonOptional,
     InvalidType,
     InvalidPoint,
@@ -26,75 +27,76 @@ const ValidateOptions = packed struct {
     should_parse: bool = true,
 };
 
-fn validate_and_parse(schema: *const Schema, obj: *const Object, options: ValidateOptions) ValidationError![]const u8 {
-    var iter = obj.iterator();
+fn validate_and_parse(schema: *const Schema, obj: *const Object) ValidationError![]const u8 {
+    var iter = schema.iterator();
 
     var out = std.ArrayList(u8).init(gpa.allocator());
     defer out.deinit();
 
     var writer = std.json.writeStream(out.writer(), .{});
     defer writer.deinit();
-
     try writer.beginObject();
 
-    while (iter.next()) |entry| {
-        const key = entry.key_ptr.*;
-        const value = entry.value_ptr.*;
+    while (iter.next()) |schema_entry| {
+        const schema_key = schema_entry.key_ptr.*;
+        const schema_field = schema_entry.value_ptr.*;
 
-        const key_schema = schema.get(key) orelse if (options.allow_excess_properties) continue else return ValidationError.UnknownKey;
+        const value = obj.get(schema_key) orelse std.json.Value{ .null = {} };
 
-        switch (value) {
-            .null => {
-                switch (key_schema.type) {
+        if (value == .null) {
+            if (schema_field.options.optional) {
+                switch (schema_field.type) {
                     .vector => |vec| switch (vec) {
                         inline else => |vecType| {
                             if (vecType.default) |default| {
-                                try writer.objectField(key);
+                                try writer.objectField(schema_key);
                                 try writer.write(default);
                                 continue;
-                            } else return ValidationError.NullNonOptional;
+                            } else return ValidationError.MissingKey;
                         },
                     },
-                    .object => return ValidationError.NullNonOptional,
+                    .object => return ValidationError.MissingKey,
                     inline else => |data| {
                         if (data.default) |default| {
-                            try writer.objectField(key);
+                            try writer.objectField(schema_key);
                             try writer.write(default);
                             continue;
-                        } else return ValidationError.NullNonOptional;
+                        } else return ValidationError.MissingKey;
                     },
                 }
-
-                if (!key_schema.options.optional) return ValidationError.NullNonOptional;
-            },
-            .bool => if (key_schema.type != .boolean) return ValidationError.InvalidType,
-            .integer => {
-                if (key_schema.type != .integer and key_schema.type != .bigint and key_schema.type != .float and key_schema.type != .date) return ValidationError.InvalidType;
-            },
-            .float => if (key_schema.type != .float) return ValidationError.InvalidType,
-            .number_string => if (key_schema.type != .bigint) return ValidationError.InvalidType,
-            .string => if (key_schema.type != .string and key_schema.type != .text) return ValidationError.InvalidType,
-            // TODO: Implement Arrays, Tuples, References & Relations
-            .array => unreachable,
-            .object => |nested| switch (key_schema.type) {
-                .object => {
-                    const parsed = try validate_and_parse(&key_schema.type.object, &nested, options);
-                    try writer.objectField(key);
-                    try out.writer().writeByte(':');
-                    try out.writer().writeAll(parsed);
-                    // Make the writer think valueDone was called
-                    // This is what makes it possible to not have to call write
-                    writer.next_punctuation = .comma;
-                    continue;
-                },
-                .point => {
-                    if (nested.keys().len != 2 or nested.get("longitude") == null or nested.get("latitude") == null) return ValidationError.InvalidPoint;
-                },
-                else => return ValidationError.InvalidType,
-            },
+            } else return ValidationError.MissingKey;
         }
 
-        try writer.objectField(key);
+        switch (schema_field.type) {
+            .string => if (value != .string) return ValidationError.InvalidType,
+            .float => if (value != .integer and value != .float) return ValidationError.InvalidType,
+            .integer => if (value != .integer) return ValidationError.InvalidType,
+            .bigint => if (value != .integer and value != .number_string) return ValidationError.InvalidType,
+            .boolean => if (value != .bool) return ValidationError.InvalidType,
+            .text => if (value != .string) return ValidationError.InvalidType,
+            .date => if (value != .string and value != .integer) return ValidationError.InvalidType,
+            .point => {
+                if (value != .object) return ValidationError.InvalidType;
+                const nested = value.object;
+                if (nested.keys().len != 2 or nested.get("longitude") == null or nested.get("latitude") == null) return ValidationError.InvalidPoint;
+            },
+            .vector => {
+                if (value != .array) return ValidationError.InvalidType;
+                // TODO: Properly validate vectors
+            },
+            .object => {
+                if (value != .object) return ValidationError.InvalidType;
+                const parsed = try validate_and_parse(&schema_field.type.object, &value.object);
+                try writer.objectField(schema_key);
+                try out.writer().writeByte(':');
+                try out.writer().writeAll(parsed);
+                // Make the writer think valueDone was called
+                // This is what makes it possible to not have to call write
+                writer.next_punctuation = .comma;
+                continue;
+            },
+        }
+        try writer.objectField(schema_key);
         try writer.write(value);
     }
 
@@ -119,7 +121,6 @@ test "validate and parse JSON" {
     try schema.put("c", .{ .type = .{ .object = inner } });
     try SchemaStore.put("TEST", .{ .schema = schema });
 
-    const result = try validate_and_parse(&SchemaStore.get("TEST").?.schema, &parsed.value.object, .{ .allow_excess_properties = true });
+    const result = try validate_and_parse(&SchemaStore.get("TEST").?.schema, &parsed.value.object);
     try std.testing.expectEqualSlices(u8, "{\"a\":1,\"b\":2,\"c\":{\"d\":\"s\"}}", result);
-    try std.testing.expectEqual(validate_and_parse(&SchemaStore.get("TEST").?.schema, &parsed.value.object, .{}), ValidationError.UnknownKey);
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Schema = std.StringHashMap(Field);
+pub const Schema = std.StringArrayHashMap(Field);
 
 pub const Field = struct {
     type: FieldType,
